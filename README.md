@@ -23,7 +23,9 @@
 
 ## 30 秒上手
 
-1. 下载 ZIP → 解压到任意文件夹 → 双击 `ShuffleStick.exe`（无需安装、无需管理员权限）。
+1. 到 [Releases 页面](https://github.com/Hubert-Zhou/shufflestick/releases/latest) 下载
+   `ShuffleStick-v0.9.0-win64.zip` → 解压到任意文件夹 → 双击 `ShuffleStick.exe`
+   （无需安装、无需管理员权限）。**仓库里只放源码**，绿色软件包在 Release 附件里。
 2. 插上要放歌的 U 盘，在窗口左上角选中对应盘符。
 3. 点 **🔍 只读诊断** —— **一个字节都不会改**。报告会列出三种规则下各自的第一首。
 4. 安全弹出 U 盘 → 让设备断电重连 → 听第一首是哪首，对照报告即可判定。
