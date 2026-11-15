@@ -2071,7 +2071,7 @@ class AboutDialog(_DialogBase):
                 self._raw_img = raw
                 self._img = raw.subsample(n, n) if n > 1 else raw
                 tk.Label(body, image=self._img, bg=CARD, bd=0).pack()
-                tk.Label(body, text="微信扫一扫 · 完全自愿",
+                tk.Label(body, text="微信扫一扫 · 赞赏码 · 完全自愿",
                          font=F_SUB, fg=INK2, bg=CARD).pack(pady=(14, 2))
             except Exception:
                 tk.Label(body, text="赞赏码图片无法读取",
