@@ -7,6 +7,9 @@ build/
 dist/
 *.spec
 
+# 宣传素材包（本地交付，不进源码仓库）
+promo/
+
 # Python 缓存
 __pycache__/
 *.py[cod]
