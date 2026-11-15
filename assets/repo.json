@@ -1,0 +1,5 @@
+{
+  "primary": "https://github.com/Hubert-Zhou/shufflestick",
+  "mirror": "",
+  "_说明": "源码仓库地址。程序每次打开关于页都会重新读取，改这个文本文件不需要重新打包 exe；只用一个仓库时 mirror 留空。"
+}

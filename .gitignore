@@ -1,0 +1,24 @@
+# 运行时数据：备份、日志、还原清单，可能很大，绝不能进仓库或发布包
+shuffler_data/
+
+# 构建产物
+release/
+build/
+dist/
+*.spec
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 个人收款码与自动生成的图标（按需本地放置，不提交）
+assets/donate_wechat.png
+assets/donate_wechat_card.png
+assets/donate_wechat_full.png
+assets/app.ico
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
