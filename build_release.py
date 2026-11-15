@@ -70,9 +70,6 @@ def make_icon() -> Path | None:
 
 def main() -> int:
     ASSETS.mkdir(exist_ok=True)
-    if not (ASSETS / "donate.json").is_file():
-        (ASSETS / "donate.json").write_text(
-            '{"goal": 100, "count": 0}\n', encoding="utf-8")
     repo = ASSETS / "repo.json"
     if not repo.is_file():
         repo.write_text('{"primary": "", "mirror": ""}\n', encoding="utf-8")
@@ -90,19 +87,35 @@ def main() -> int:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     for p in (DIST, RELEASE / "build", PKG):
         if p.is_dir():
-            p.rename(old / f"{p.name}_{stamp}")
+            try:
+                p.rename(old / f"{p.name}_{stamp}")
+            except OSError as exc:
+                print(f"     ! {p.name} 正被占用，已保留原位置：{exc.strerror}")
+                if p == DIST:
+                    print("       请关闭 release/dist/ShuffleStick/ShuffleStick.exe，")
+                    print("       下次打包会自动归档这个中间目录")
     if ZIP.is_file():
-        ZIP.rename(old / f"{ZIP.name}.{stamp}")
+        try:
+            ZIP.rename(old / f"{ZIP.name}.{stamp}")
+        except OSError as exc:
+            print(f"     ! 旧 ZIP 占用，已跳过归档：{exc.strerror}")
     print(f"     旧产物留在 {old.name}/，确认新版无误后可自行删除")
+
+    # 中间产物放在 release/_build/ 下的独立目录：
+    # 既避开被占用的旧 dist，也不会在 release 根目录留下「看起来像成品」的 exe
+    build_root = RELEASE / "_build" / stamp
+    build_dist = build_root / "dist"
+    build_work = build_root / "work"
+    build_root.mkdir(parents=True, exist_ok=True)
 
     icon = make_icon()
     print("[2/5] PyInstaller 打包（onedir / 无控制台 / 关 UPX）…")
     cmd = [sys.executable, "-m", "PyInstaller",
            "--noconfirm", "--clean", "--onedir", "--windowed", "--noupx",
            "--name", PKG_NAME,
-           "--distpath", str(DIST),
-           "--workpath", str(RELEASE / "build"),
-           "--specpath", str(RELEASE)]
+           "--distpath", str(build_dist),
+           "--workpath", str(build_work),
+           "--specpath", str(build_root)]
     if icon:
         cmd += ["--icon", str(icon)]
     cmd.append(str(ENTRY))
@@ -111,7 +124,7 @@ def main() -> int:
         print("PyInstaller 失败，已停止。")
         return 1
 
-    built = DIST / PKG_NAME
+    built = build_dist / PKG_NAME
     exe = built / f"{PKG_NAME}.exe"
     if not exe.is_file():
         print(f"未找到生成的 exe：{exe}")
@@ -125,7 +138,7 @@ def main() -> int:
     # 开源项目：随包附完整源码，下载者不联网也能审阅「这个 exe 到底动了什么」
     shutil.copy2(ENTRY, PKG / ENTRY.name)
     (PKG / "assets").mkdir(exist_ok=True)
-    for name in ("donate.json", "repo.json", "README.txt"):
+    for name in ("repo.json", "README.txt"):
         if (ASSETS / name).is_file():
             shutil.copy2(ASSETS / name, PKG / "assets" / name)
     if (ASSETS / "donate_wechat.png").is_file():
@@ -141,14 +154,20 @@ def main() -> int:
         "绿色软件，无需安装、无需管理员权限。双击 ShuffleStick.exe 即可运行；\n"
         "整个文件夹可以拷到任何地方。\n\n"
         "第一次使用：\n"
-        "  1. 插上要放歌的 U 盘，在窗口里选中对应盘符\n"
-        "  2. 点「只读诊断」—— 一个字节都不会改，先看设备按什么顺序读\n"
-        "  3. 确认无误后点「绑定为播放设备」（一次性，防止误动普通 U 盘）\n"
-        "  4. 点「执行洗牌」打乱现有歌单，或「随机拷贝」从电脑音频库挑一批新的\n\n"
+        "  程序会自动打开一次引导，按提示插入 U 盘、选中盘符、确认绑定即可。\n"
+        "  绑定前不会改动 U 盘上的任何文件，之后只有这块盘允许写入。\n\n"
+        "日常使用：\n"
+        "  点「换一批歌」从电脑音频库随机挑一批拷进 U 盘；\n"
+        "  也可用下方「打乱现有歌单」或「还原上一次」。\n"
+        "  低频参数都在右上角「设置」里，主界面保持简洁。\n\n"
         "详细原理、已知限制与免责声明见 README.md。\n"
         "配置 / 日志 / 备份保存在本目录下的 shuffler_data/（首次运行自动创建）。\n"
         "程序完全离线：不联网、不上传、不收集信息、无广告、无捆绑。\n",
         encoding="utf-8")
+
+    # 本次中间产物已经在 release/_build/<stamp>/ 下，
+    # release 根目录只有正式绿色包、ZIP 与校验和，不会被误点成"半成品"。
+    print("     中间产物位于 release/_build/，不出现在发布目录顶层")
 
     print("[4/5] 生成 SHA256SUMS.txt …")
     lines = []

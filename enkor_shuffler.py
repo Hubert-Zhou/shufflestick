@@ -52,7 +52,6 @@ APP_TITLE = f"{APP_NAME} v{APP_VERSION} · 免费开源"
 LICENSE_NAME = "MIT"
 SOURCE_URL = "https://github.com/Hubert-Zhou/shufflestick"
 SOURCE_URL_MIRROR = ""            # 只用一个仓库时留空
-DONATE_GOAL = 100                 # 目标：100 位支持者
 DONATE_SLOGAN = "愿下一首也刚好，就当见过面。"   # 赞赏码上方的一句话
 ASSUMED_MBPS = 1.0               # 仅用于「保守估算」提示，实际吞吐因设备而异
 
@@ -66,7 +65,6 @@ LOG_ROOT = DATA / "logs"
 MANIFEST = DATA / "last_manifest.json"
 ASSETS = BASE / "assets"
 DONATE_IMAGE = ASSETS / "donate_wechat.png"
-DONATE_STATE = ASSETS / "donate.json"
 
 AUDIO_EXTS = {".mp3", ".flac", ".wav", ".aac", ".m4a", ".ape",
               ".ogg", ".wma", ".mp2", ".aif", ".aiff", ".alac"}
@@ -689,6 +687,11 @@ DEFAULT_CONFIG = {
     "last_batch": [],            # 上一批的 key（源库相对路径，小写）
     "device_whitelist": [],      # 已确认是播放设备的 U 盘指纹
     "remind_on_insert": False,   # 插盘仅提醒，绝不自动写盘
+    "onboarded": False,          # 一次性引导是否已完成
+    "shuffle_mode": "fast",      # 重排策略（原为主界面 radio，现收进设置）
+    "safe_names": False,         # 是否改用 001.flac 安全短名
+    "scan_recursive": False,     # 洗牌扫描是否含子目录
+    "seed": "",                  # 随机种子
 }
 
 
@@ -1149,14 +1152,14 @@ def diagnose_text(d: dict) -> str:
                 "【怎么判定】",
                 "  安全弹出 U 盘 → 让设备断电重连 → 听第一首是哪首，对照上表即可。",
                 "  若第一首 = B，说明设备按拷贝顺序读盘：改文件名 / 编号完全无效，",
-                "  只能用「⚡ 极速重排」或「清盘重写」改变顺序。",
+                "  只能用「极速重排」或「清盘重写」改变顺序。",
                 "  若第一首 = A，「仅重命名」就够用；= C 则按修改时间排。",
             ]
         else:
             lines += [
                 "【怎么判定】",
                 "  三种规则算出的首曲相同，靠「听第一首」暂时区分不出来。",
-                "  可以直接跑一次「⚡ 极速重排」（数秒、零拷贝），再拔插听第一首是否变化；",
+                "  可以直接跑一次「极速重排」（数秒、零拷贝），再拔插听第一首是否变化；",
                 "  没变就点「一键还原」再改试「清盘重写」。",
             ]
         lines += [
@@ -1181,27 +1184,127 @@ def source_urls() -> dict:
     return urls
 
 
-def donate_state() -> dict:
-    """读取本地打赏进度（不联网）。只读 goal/count 两个字段，坏文件安全降级。"""
-    try:
-        raw = json.loads(DONATE_STATE.read_text(encoding="utf-8"))
-        goal = max(1, int(raw.get("goal", DONATE_GOAL)))
-        count = max(0, int(raw.get("count", 0)))
-        return {"goal": goal, "count": count}
-    except Exception:
-        return {"goal": DONATE_GOAL, "count": 0}
-
-
 # --------------------------------------------------------------------------- GUI
+# 视觉系统：浅色底 / 白色卡片 / 单一强调色 / 严格字阶 / 大留白。
+# 设计原则：一个窗口只回答「今天要做什么」；参数退到设置；消除一切假状态。
 
-HELP_TEXT = (
-    "🔍 第一次用先点「只读诊断」：一个字节都不改，就能判断你的设备按哪种顺序播放（改名对很多固件无效）。\n"
-    "安全：只有「绑定为播放设备」白名单里的盘允许写入；插盘仅弹提醒、绝不自动动手，其它 U 盘一律忽略。\n"
-    "⚡ 极速重排约数秒（零拷贝）；📁 随机拷贝从本地音频库按容量挑歌，写入顺序即播放顺序，源目录自动记住。"
+BG, CARD, INK = "#F5F5F7", "#FFFFFF", "#1D1D1F"
+INK2, INK3 = "#6E6E73", "#A1A1A6"
+ACCENT, ACCENT_DARK = "#0071E3", "#0062C4"
+LINE, OK_GREEN, WARN = "#E3E3E8", "#248A3D", "#B25000"
+
+F_H1 = ("Microsoft YaHei UI", 21, "bold")
+F_H2 = ("Microsoft YaHei UI", 14, "bold")
+F_BODY = ("Microsoft YaHei UI", 11)
+F_SUB = ("Microsoft YaHei UI", 10)
+F_FINE = ("Microsoft YaHei UI", 9)
+F_BTN = ("Microsoft YaHei UI", 12, "bold")
+
+HELP_TEXT = "只读诊断不会改动任何文件；只有已绑定的播放设备才允许写入。"
+DISCLAIMER = (
+    "本工具会移动、重命名或删除 U 盘上的音频文件，使用前请备份重要数据。\n"
+    "所有写操作都需要手动执行并二次确认，且只对已绑定的播放设备生效；"
+    "插盘只提醒，绝不自动写盘。\n"
+    "作者不对数据丢失、设备损坏或任何间接损失负责。"
 )
-
 AUTO_POLL_MS = 2000          # 插盘检测间隔
 AUTO_MIN_TRACKS = 5          # 音频数低于此值不自动触发（防误认空盘）
+
+
+def setup_theme(root):
+    """全局样式。tk 原生控件自行着色，ttk 控件统一走这里的样式表。"""
+    if ttk is None:
+        return None
+    st = ttk.Style(root)
+    if "clam" in st.theme_names():
+        st.theme_use("clam")
+    st.configure(".", background=BG, foreground=INK, font=F_BODY)
+    st.configure("Bg.TFrame", background=BG)
+    st.configure("Card.TFrame", background=CARD)
+    st.configure("Card.TLabel", background=CARD, foreground=INK, font=F_BODY)
+    st.configure("Sub.TLabel", background=CARD, foreground=INK2, font=F_SUB)
+    st.configure("BgSub.TLabel", background=BG, foreground=INK2, font=F_SUB)
+    st.configure("Primary.TButton", background=ACCENT, foreground="#FFFFFF",
+                 font=F_BTN, borderwidth=0, relief="flat", padding=(28, 12))
+    st.map("Primary.TButton",
+           background=[("active", ACCENT_DARK), ("disabled", "#C4DCF5")],
+           foreground=[("disabled", "#FFFFFF")])
+    st.configure("Ghost.TButton", background=CARD, foreground=ACCENT,
+                 font=F_BODY, borderwidth=0, relief="flat", padding=(10, 6))
+    st.map("Ghost.TButton", background=[("active", "#EDF4FE")])
+    st.configure("Bare.TButton", background=BG, foreground=INK2,
+                 font=F_SUB, borderwidth=0, relief="flat", padding=(8, 4))
+    st.map("Bare.TButton", background=[("active", "#E8E8ED")],
+           foreground=[("active", INK)])
+    st.configure("TProgressbar", background=ACCENT, troughcolor=LINE,
+                 borderwidth=0, thickness=4)
+    st.configure("Treeview", background=CARD, fieldbackground=CARD,
+                 foreground=INK, borderwidth=0, rowheight=24, font=F_SUB)
+    st.configure("Treeview.Heading", background="#FAFAFC", foreground=INK2,
+                 font=F_SUB, borderwidth=0, relief="flat")
+    st.configure("TCombobox", fieldbackground=CARD, background=CARD,
+                 foreground=INK, borderwidth=0, arrowcolor=INK2, padding=6)
+    # 旧对话框仍在用的基础控件与样式别名，一并统一到同一套配色
+    for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
+                 "TRadiobutton", "TCheckbutton", "TButton", "TEntry", "TSpinbox"):
+        st.configure(name, background=BG, foreground=INK, font=F_BODY)
+    st.configure("TButton", padding=(10, 6), borderwidth=0, relief="flat")
+    st.map("TButton", background=[("active", "#E8E8ED")])
+    st.configure("Title.TLabel", background=BG, foreground=INK, font=F_H2)
+    st.configure("Hint.TLabel", background=BG, foreground=INK2, font=F_SUB)
+    st.configure("Go.TButton", background=ACCENT, foreground="#FFFFFF",
+                 font=F_BTN, borderwidth=0, relief="flat", padding=(16, 9))
+    st.map("Go.TButton", background=[("active", ACCENT_DARK),
+                                     ("disabled", "#C4DCF5")])
+    return st
+
+
+def ui_label(master, text, font=F_BODY, fg=INK, bg=CARD, **kw):
+    """统一的文字标签：默认左对齐、不换行、无边框。"""
+    return tk.Label(master, text=text, font=font, fg=fg, bg=bg,
+                    anchor="w", justify="left", bd=0, **kw)
+
+
+def ui_card(master, pad=20):
+    """白色卡片 + 1px 细边 + 大留白。返回 (外框, 内容 Frame)。"""
+    outer = tk.Frame(master, bg=CARD, highlightbackground=LINE,
+                     highlightthickness=1, bd=0)
+    inner = tk.Frame(outer, bg=CARD)
+    inner.pack(fill="both", expand=True, padx=pad, pady=pad)
+    return outer, inner
+
+
+def ui_button(master, text, command, kind="primary", padx=30):
+    """扁平按钮：primary 填充蓝；link 是无边框文字按钮。"""
+    if kind == "primary":
+        return tk.Button(master, text=text, command=command, font=F_BTN,
+                         bg=ACCENT, fg="#FFFFFF", activebackground=ACCENT_DARK,
+                         activeforeground="#FFFFFF", relief="flat", bd=0,
+                         padx=padx, pady=11, cursor="hand2", highlightthickness=0)
+    if kind == "link":
+        return tk.Button(master, text=text, command=command, font=F_BODY,
+                         bg=master.cget("bg"), fg=ACCENT,
+                         activebackground=master.cget("bg"),
+                         activeforeground=ACCENT_DARK, relief="flat", bd=0,
+                         padx=6, pady=4, cursor="hand2", highlightthickness=0)
+    return tk.Button(master, text=text, command=command, font=F_SUB,
+                     bg=master.cget("bg"), fg=INK2,
+                     activebackground=master.cget("bg"), activeforeground=INK,
+                     relief="flat", bd=0, padx=6, pady=3,
+                     cursor="hand2", highlightthickness=0)
+
+
+def ui_divider(master, bg=CARD):
+    return tk.Frame(master, bg=LINE, height=1)
+
+
+def status_dot(master, bg=CARD, color=INK3, size=9):
+    """状态圆点，替代原来的 emoji 图标。"""
+    c = tk.Canvas(master, width=size, height=size, bg=bg,
+                  highlightthickness=0, bd=0)
+    c.create_oval(1, 1, size - 1, size - 1, fill=color, outline=color)
+    return c
+
 
 
 def auto_decision(was_present: bool, present: bool, busy: bool,
@@ -1222,13 +1325,13 @@ _AppBase = tk.Tk if tk is not None else object
 class App(_AppBase):
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE)
-        # 按实际屏幕留边自适应；不再放大 tk scaling（高分屏下会把底部按钮挤出窗口）
+        self.title(APP_NAME)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w = min(1060, max(880, sw - 140))
-        h = min(660, max(520, sh - 150))
+        w = min(820, max(720, sw - 160))
+        h = min(580, max(500, sh - 150))
         self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 5)}")
-        self.minsize(860, 500)
+        self.minsize(720, 500)
+        self.configure(bg=BG)
 
         self._closing = False
         self.bind("<Control-Return>", lambda e: self._execute())
@@ -1238,13 +1341,13 @@ class App(_AppBase):
 
         self.cfg = load_config()
         self.root_var = tk.StringVar()
-        self.mode = tk.StringVar(value="fast")          # 零拷贝重排：秒级，已验证 FAT 目录项跟随 move
-        self.safe_names = tk.BooleanVar(value=False)    # 保留中文歌名
-        self.recursive = tk.BooleanVar(value=False)
-        self.seed = tk.StringVar(value="")
-        self.auto = tk.BooleanVar(value=bool(self.cfg.get("remind_on_insert")))  # 仅提醒
+        self.mode = tk.StringVar(value=str(self.cfg.get("shuffle_mode") or "fast"))
+        self.safe_names = tk.BooleanVar(value=bool(self.cfg.get("safe_names")))
+        self.recursive = tk.BooleanVar(value=bool(self.cfg.get("scan_recursive")))
+        self.seed = tk.StringVar(value=str(self.cfg.get("seed") or ""))
+        self.auto = tk.BooleanVar(value=bool(self.cfg.get("remind_on_insert")))
         self.cooldown_var = tk.IntVar(value=10)
-        self.status = tk.StringVar(value="就绪 · 尚未改动任何文件")
+        self.status = tk.StringVar(value="尚未改动任何文件")
         self.tracks: list[Track] = []
         self.order: list[Track] = []
         self.plan: list[dict] = []
@@ -1259,136 +1362,156 @@ class App(_AppBase):
         self._copy_win = None
         self._diag_win = None
         self._about_win = None
+        self._settings_win = None
+        self._setup_win = None
+        self.detail_shown = False
 
         self._build_ui()
         self._refresh_drives()
         self._update_device_status()
         self._pump_id = self.after(100, self._pump)
         self._tick_id = self.after(AUTO_POLL_MS, self._auto_tick)
+        # 一次性引导独立出现，不占用日常界面
+        self.after(350, self._maybe_setup)
 
     # -- 布局 ----------------------------------------------------------------
     def _build_ui(self):
-        style = ttk.Style(self)
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-        font = ("Microsoft YaHei UI", 10)
-        style.configure(".", font=font)
-        style.configure("Treeview", rowheight=22)
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
-        style.configure("Hint.TLabel", foreground="#666")
-        style.configure("Go.TButton", foreground="#ffffff", background="#1668c8",
-                        font=("Microsoft YaHei UI", 10, "bold"), padding=(16, 6))
-        style.map("Go.TButton", background=[("active", "#1357aa"),
-                                            ("disabled", "#9fb8d6")])
+        """日常界面只有一个主操作、一张设备卡片、一行状态。其余全部收进设置 / 引导。"""
+        setup_theme(self)
 
-        outer = ttk.Frame(self, padding=10)
-        outer.pack(fill="both", expand=True)
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=32, pady=(26, 18))
+        ui_label(top, "ShuffleStick", F_H2, INK, BG).pack(side="left")
+        ui_label(top, "U 盘歌单乱序助手", F_SUB, INK3, BG).pack(side="left", padx=(10, 0))
+        ui_button(top, "关于", self._open_about, "quiet").pack(side="right")
+        ui_button(top, "设置", self._open_settings, "quiet").pack(side="right", padx=(0, 14))
 
-        head = ttk.Frame(outer)
-        ttk.Label(head, text=APP_NAME, style="Title.TLabel").pack(side="left")
-        ttk.Label(head, text=f"  v{APP_VERSION} · 免费开源 · 不联网 · 适用车载 / 音箱 / 老 MP3 / 骨传导耳机",
-                  style="Hint.TLabel").pack(side="left", pady=4)
-
-        bar = ttk.Frame(outer)
-        ttk.Label(bar, text="目标 U 盘：").pack(side="left")
-        self.drive_cb = ttk.Combobox(bar, textvariable=self.root_var, width=8,
+        # 设备卡片：唯一的状态区，用圆点代替 emoji
+        card, dev = ui_card(self, pad=18)
+        r1 = tk.Frame(dev, bg=CARD)
+        r1.pack(fill="x")
+        self.dev_dot = status_dot(r1, CARD, INK3)
+        self.dev_dot.pack(side="left", padx=(0, 9))
+        self.dev_lbl = ui_label(r1, "正在检测设备…", F_BODY, INK, CARD)
+        self.dev_lbl.pack(side="left")
+        ui_button(r1, "刷新", self._refresh_drives, "quiet").pack(side="right")
+        self.drive_cb = ttk.Combobox(r1, textvariable=self.root_var, width=6,
                                      state="readonly")
-        self.drive_cb.pack(side="left")
+        self.drive_cb.pack(side="right", padx=(0, 12))
         self.drive_cb.bind("<<ComboboxSelected>>", lambda _: self._rescan())
-        ttk.Button(bar, text="刷新", width=7, command=self._refresh_drives).pack(side="left", padx=6)
-        self.info_lbl = ttk.Label(bar, text="", style="Hint.TLabel")
-        self.info_lbl.pack(side="left", padx=10)
-        self.dev_lbl = ttk.Label(bar, text="", style="Hint.TLabel")
-        self.dev_lbl.pack(side="right")
-        ttk.Button(bar, text="🔗 绑定为播放设备",
-                   command=self._bind_device).pack(side="right", padx=(6, 8))
+        r2 = tk.Frame(dev, bg=CARD)
+        r2.pack(fill="x", pady=(9, 0))
+        self.info_lbl = ui_label(r2, "", F_SUB, INK2, CARD)
+        self.info_lbl.pack(side="left")
+        self.bind_btn = ui_button(r2, "绑定为播放设备", self._bind_device, "link")
+        self.bind_btn.pack(side="right")
+        card.pack(fill="x", padx=32, pady=(0, 20))
 
-        # 双栏列表（最后 pack，自动吃掉剩余空间）
-        lists = ttk.Frame(outer)
-        self.left = self._make_tree(lists, "当前顺序（目录项 / 拷贝顺序）")
-        self.right = self._make_tree(lists, "洗牌后顺序（预览，未写入）")
-        self.left.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        self.right.pack(side="right", fill="both", expand=True, padx=(5, 0))
+        # 底部状态栏先占位，保证任何窗口尺寸下都可见
+        self.foot = tk.Frame(self, bg=BG)
+        self.foot.pack(side="bottom", fill="x", padx=32, pady=(12, 20))
+        tk.Label(self.foot, textvariable=self.status, font=F_FINE,
+                 fg=INK2, bg=BG, anchor="w").pack(side="left")
+        self.detail_btn = ui_button(self.foot, "查看顺序详情",
+                                    self._toggle_details, "quiet")
+        self.detail_btn.pack(side="right")
+        self.pbar = ttk.Progressbar(self, mode="determinate", maximum=100)
 
-        # 选项区
-        opt = ttk.LabelFrame(outer, text=" 洗牌设置 ", padding=7)
-        row1 = ttk.Frame(opt); row1.pack(fill="x")
-        ttk.Radiobutton(row1, text="⚡ 极速重排（★ 默认 · 秒级 · 零拷贝）",
-                        variable=self.mode, value="fast").pack(side="left")
-        ttk.Radiobutton(row1, text="清盘重写（慢 · 兼容兜底）",
-                        variable=self.mode, value="rewrite").pack(side="left", padx=12)
-        ttk.Radiobutton(row1, text="仅重命名（多数设备无效）",
-                        variable=self.mode, value="rename").pack(side="left", padx=12)
-        row2 = ttk.Frame(opt); row2.pack(fill="x", pady=(6, 0))
-        ttk.Checkbutton(row2, text="改用 001.flac 安全短名（默认关闭 = 保留中文歌名）",
-                        variable=self.safe_names, command=self._preview).pack(side="left")
-        ttk.Checkbutton(row2, text="包含子目录", variable=self.recursive,
-                        command=self._rescan).pack(side="left", padx=16)
-        ttk.Label(row2, text="随机种子(可留空)：").pack(side="left", padx=(16, 2))
-        ttk.Entry(row2, textvariable=self.seed, width=12).pack(side="left")
-        row3 = ttk.Frame(opt); row3.pack(fill="x", pady=(7, 0))
-        ttk.Checkbutton(row3, text="插盘时提醒我（仅弹提示 · 绝不自动写盘）",
-                        variable=self.auto, command=self._toggle_auto).pack(side="left")
-        ttk.Label(row3, text="提醒冷却：").pack(side="left", padx=(16, 2))
-        ttk.Spinbox(row3, from_=0, to=240, width=4,
-                    textvariable=self.cooldown_var).pack(side="left")
-        ttk.Label(row3, text="分钟", style="Hint.TLabel").pack(side="left", padx=(2, 0))
-        ttk.Label(row3, text="· 需保持本窗口开启", style="Hint.TLabel").pack(
-            side="left", padx=(12, 0))
+        self.center = tk.Frame(self, bg=BG)
+        self.center.pack(fill="both", expand=True, padx=32)
 
-        # 说明
-        hint = ttk.LabelFrame(outer, text=" 已判定结论 & 操作提示 ", padding=6)
-        ttk.Label(hint, text=HELP_TEXT, justify="left", style="Hint.TLabel",
-                  wraplength=820).pack(anchor="w")
+        # 简视图：一句话价值 + 一个主按钮 + 三个低权重次要操作
+        self.simple = tk.Frame(self.center, bg=BG)
+        self.hero_title = ui_label(self.simple, "给歌单换个顺序", F_H1, INK, BG)
+        self.hero_title.pack(pady=(12, 0))
+        self.hero_sub = ui_label(
+            self.simple,
+            "从电脑音频库随机挑一批歌拷进 U 盘，写入顺序就是播放顺序。",
+            F_BODY, INK2, BG)
+        self.hero_sub.pack(pady=(10, 0))
+        self.copy_btn = ui_button(self.simple, "换一批歌", self._open_copy_dialog)
+        self.copy_btn.pack(pady=(30, 0))
+        links = tk.Frame(self.simple, bg=BG)
+        links.pack(pady=(26, 0))
+        self.run_btn = ui_button(links, "打乱现有歌单", self._execute, "link")
+        self.run_btn.pack(side="left", padx=10)
+        self.rst_btn = ui_button(links, "还原上一次", self._restore, "link")
+        self.rst_btn.pack(side="left", padx=10)
+        self.diag_btn = ui_button(links, "只读诊断", self._open_diagnose, "link")
+        self.diag_btn.pack(side="left", padx=10)
+        self.simple.pack(fill="both", expand=True)
 
-        # 操作区：执行按钮放最左并高亮，固定贴在底部
-        act = ttk.Frame(outer)
-        self.copy_btn = ttk.Button(act, text="📁 随机拷贝",
-                                   style="Go.TButton", command=self._open_copy_dialog)
-        self.copy_btn.pack(side="left")
-        self.run_btn = ttk.Button(act, text="▶ 执行洗牌", command=self._execute)
-        self.run_btn.pack(side="left", padx=8)
-        ttk.Button(act, text="🎲 换一批", command=self._shuffle).pack(side="left", padx=8)
-        self.rst_btn = ttk.Button(act, text="一键还原", command=self._restore)
-        self.rst_btn.pack(side="left")
-        self.diag_btn = ttk.Button(act, text="🔍 只读诊断", command=self._open_diagnose)
-        self.diag_btn.pack(side="left", padx=8)
-        self.pbar = ttk.Progressbar(act, mode="determinate", maximum=100, length=130)
-        self.pbar.pack(side="right")
+        # 详情视图：与简视图互斥，默认不出现
+        self.detail = tk.Frame(self.center, bg=BG)
+        lists = tk.Frame(self.detail, bg=BG)
+        self.left = self._make_tree(lists, "当前顺序")
+        self.right = self._make_tree(lists, "随机预览（未写入）")
+        self.left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self.right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+        lists.pack(fill="both", expand=True)
 
-        foot = ttk.Frame(outer)
-        ttk.Label(foot, textvariable=self.status, style="Hint.TLabel").pack(side="left")
-        ttk.Button(foot, text="❤ 关于 / 支持一下", command=self._open_about).pack(side="right")
-        ttk.Label(foot, text="Ctrl+Enter 执行 · F5 换一批 · Ctrl+Z 还原  |",
-                  style="Hint.TLabel").pack(side="right", padx=(0, 6))
+    # -- 视图切换 / 弹窗入口 -------------------------------------------------
+    def _toggle_details(self):
+        self.detail_shown = not self.detail_shown
+        if self.detail_shown:
+            self.simple.pack_forget()
+            self.detail.pack(fill="both", expand=True)
+            self.detail_btn.configure(text="返回")
+        else:
+            self.detail.pack_forget()
+            self.simple.pack(fill="both", expand=True)
+            self.detail_btn.configure(text="查看顺序详情")
 
-        # pack 顺序 = 空间分配优先级：底部固定区先占位，按钮永远不会被挤出窗口
-        foot.pack(side="bottom", fill="x", pady=(5, 0))
-        act.pack(side="bottom", fill="x", pady=(7, 0))
-        hint.pack(side="bottom", fill="x", pady=(5, 0))
-        opt.pack(side="bottom", fill="x", pady=(7, 0))
-        head.pack(side="top", fill="x")
-        bar.pack(side="top", fill="x", pady=(7, 5))
-        lists.pack(side="top", fill="both", expand=True, pady=5)
+    def _maybe_setup(self):
+        if self._closing:
+            return
+        # 老用户已经绑定过设备，直接标记为已完成引导，不打扰
+        if self.cfg.get("device_whitelist"):
+            if not self.cfg.get("onboarded"):
+                self.cfg["onboarded"] = True
+                save_config(self.cfg)
+            return
+        if not self.cfg.get("onboarded"):
+            self._open_setup()
+
+    def _open_setup(self):
+        if self._setup_win is not None and self._setup_win.winfo_exists():
+            self._setup_win.lift()
+            return
+        self._setup_win = SetupDialog(self)
+
+    def _open_settings(self):
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            return
+        self._settings_win = SettingsDialog(self)
 
     def _make_tree(self, parent, title):
-        frm = ttk.LabelFrame(parent, text=f" {title} ", padding=6)
+        frm = tk.Frame(parent, bg=CARD, highlightbackground=LINE,
+                       highlightthickness=1, bd=0)
+        ui_label(frm, title, F_SUB, INK2, CARD).pack(anchor="w", padx=14, pady=(12, 6))
+        body = tk.Frame(frm, bg=CARD)
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
         cols = ("no", "name", "size")
-        tv = ttk.Treeview(frm, columns=cols, show="headings", selectmode="browse")
-        tv.heading("no", text="#"); tv.column("no", width=46, anchor="center", stretch=False)
-        tv.heading("name", text="文件名"); tv.column("name", width=330, anchor="w")
-        tv.heading("size", text="大小"); tv.column("size", width=76, anchor="e", stretch=False)
-        sb = ttk.Scrollbar(frm, orient="vertical", command=tv.yview)
+        tv = ttk.Treeview(body, columns=cols, show="headings", selectmode="browse")
+        tv.heading("no", text="#"); tv.column("no", width=44, anchor="center", stretch=False)
+        tv.heading("name", text="文件名"); tv.column("name", width=210, anchor="w")
+        tv.heading("size", text="大小"); tv.column("size", width=70, anchor="e", stretch=False)
+        sb = ttk.Scrollbar(body, orient="vertical", command=tv.yview)
         tv.configure(yscrollcommand=sb.set)
         tv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         return frm
 
-    def _tree_of(self, frm):
-        for w in frm.winfo_children():
+    @staticmethod
+    def _tree_of(frm):
+        """递归找 Treeview（卡片化之后表格多了一层容器）。"""
+        stack = [frm]
+        while stack:
+            w = stack.pop()
             if isinstance(w, ttk.Treeview):
                 return w
+            stack.extend(w.winfo_children())
         raise RuntimeError("tree missing")
 
     # -- 数据 ----------------------------------------------------------------
@@ -1425,12 +1548,12 @@ class App(_AppBase):
             except RuntimeError:
                 self.order = list(self.tracks)
             self._preview()
-            self.status.set(f"只读扫描完成：{len(self.tracks)} 首 · 已生成随机预览，点「执行洗牌」即可")
+            self.status.set(f"已扫描 {len(self.tracks)} 首 · 未改动任何文件")
             # 有备份目录但没有还原清单 = 上次清盘重写中断，此时不要基于残缺歌单重新洗
             try:
                 if not MANIFEST.is_file() and any(BACKUP_ROOT.iterdir()):
                     self.status.set(
-                        "⚠ 检测到未完成的清盘重写备份：U 盘可能只恢复了一部分，"
+                        "检测到未完成的清盘重写备份：U 盘可能只恢复了一部分，"
                         "请等原任务跑完或点「一键还原」，不要重新洗牌")
             except OSError:
                 pass
@@ -1467,10 +1590,15 @@ class App(_AppBase):
     def _set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        self.run_btn.configure(state=state)
-        self.rst_btn.configure(state=state)
-        self.copy_btn.configure(state=state)
-        self.diag_btn.configure(state=state)   # 写盘期间目录在变，暂时禁用诊断
+        for btn in (self.run_btn, self.rst_btn, self.copy_btn, self.diag_btn):
+            btn.configure(state=state)   # 写盘期间目录在变，暂时禁用诊断
+        if busy:
+            self.pbar.pack(side="bottom", fill="x", padx=32, pady=(0, 4),
+                           before=self.foot)
+        else:
+            self.pbar.pack_forget()
+            # 恢复「按绑定状态决定」的按钮可用性，别把未绑定盘的写操作放开
+            self._update_device_status()
 
     def _progress(self, done, total, text):
         self.q.put(("progress", (done, total, text)))
@@ -1551,24 +1679,58 @@ class App(_AppBase):
             f"卷序列号：{fp['serial'] or '读取失败'} · 卷标：{fp['label'] or '（空）'}\n"
             f"容量：{fp['total'] / 1024**3:.1f} GB · {fp['fs']} · 音频 {fp['audio_count']} 首\n\n"
             "为防止误操作存文件的普通 U 盘，只有绑定过的播放设备才允许写入。\n"
-            "请确认这就是你要放歌的那台设备，点右上角「🔗 绑定为播放设备」。")
+            "请确认这就是你要放歌的那台设备，点主界面的「开始设置」完成绑定。")
         return False
 
+    def _set_dot(self, color: str) -> None:
+        if not hasattr(self, "dev_dot"):
+            return
+        self.dev_dot.delete("all")
+        self.dev_dot.create_oval(1, 1, 8, 8, fill=color, outline=color)
+
     def _update_device_status(self) -> None:
+        """设备状态、主按钮文案、引导语统一由一个状态驱动，界面自己说明下一步。"""
         if not hasattr(self, "dev_lbl"):
             return
         root = self.root_var.get()
-        if not root or not os.path.isdir(root):
-            self.dev_lbl.configure(text="⚪ 未检测到 U 盘")
-            return
-        fp = device_fingerprint(root)
-        rec = match_headset(fp, self.cfg)
-        if rec:
-            self.dev_lbl.configure(
-                text=f"✅ 已识别播放设备 · {rec.get('model') or '型号未知'} / {fp['serial']}")
+        bound = False
+        if root and os.path.isdir(root):
+            fp = device_fingerprint(root)
+            rec = match_headset(fp, self.cfg)
+            bound = bool(rec)
+            if rec:
+                self._set_dot(OK_GREEN)
+                self.dev_lbl.configure(
+                    text=f"已连接播放设备 · {rec.get('model') or '播放设备'}")
+                self.bind_btn.configure(text="重新绑定")
+            else:
+                self._set_dot(WARN)
+                self.dev_lbl.configure(text="未绑定的 U 盘 · 只读，不会写入")
+                self.bind_btn.configure(text="绑定为播放设备")
         else:
-            self.dev_lbl.configure(
-                text=f"⚠ 未绑定 / {fp['serial'] or '?'} · 禁止写入")
+            self._set_dot(INK3)
+            self.dev_lbl.configure(text="未检测到 U 盘")
+            self.bind_btn.configure(text="绑定为播放设备")
+
+        if not getattr(self, "copy_btn", None):
+            return
+        # 未绑定时禁用写操作，只留只读诊断可点；界面自己说清下一步
+        write_state = "normal" if (bound and not self.busy) else "disabled"
+        self.run_btn.configure(state=write_state)
+        self.rst_btn.configure(state=write_state)
+        if bound:
+            self.hero_title.configure(text="给歌单换个顺序")
+            self.hero_sub.configure(
+                text="从电脑音频库随机挑一批歌拷进 U 盘，写入顺序就是播放顺序。")
+            self.copy_btn.configure(text="换一批歌",
+                                    command=self._open_copy_dialog,
+                                    bg=ACCENT, state=write_state)
+        else:
+            self.hero_title.configure(text="先花十秒认识你的设备")
+            self.hero_sub.configure(
+                text="绑定后只有这块盘允许写入，其它 U 盘一律忽略，全程不会自动改动文件。")
+            self.copy_btn.configure(text="开始设置", command=self._open_setup,
+                                    bg=ACCENT, state="normal")
 
     def _bind_device(self) -> None:
         root = self.root_var.get()
@@ -1678,18 +1840,19 @@ class App(_AppBase):
         self._notify_open = True
         win = tk.Toplevel(self)
         win.title("检测到播放设备")
-        win.geometry("440x210")
+        win.geometry("400x210")
         win.transient(self)
-        frm = ttk.Frame(win, padding=16)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="🔌 检测到已绑定的播放设备",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(frm, style="Hint.TLabel", justify="left",
-                  text=(f"{root} · {rec.get('model') or '型号未知'}\n"
-                        f"卷序列号 {fp['serial']} · 当前 {fp['audio_count']} 首音频")
-                  ).pack(anchor="w", pady=(10, 2))
-        ttk.Label(frm, style="Hint.TLabel",
-                  text="工具不会自动改动 U 盘，需要你亲自点一下。").pack(anchor="w", pady=(0, 10))
+        win.configure(bg=BG)
+        setup_theme(win)
+        outer = tk.Frame(win, bg=BG)
+        outer.pack(fill="both", expand=True, padx=24, pady=22)
+        card, body = ui_card(outer, pad=16)
+        ui_label(body, "播放设备已连接", F_H2, INK, CARD).pack(anchor="w")
+        ui_label(body, f"{root} · {rec.get('model') or '播放设备'}",
+                 F_SUB, INK2, CARD).pack(anchor="w", pady=(8, 0))
+        ui_label(body, "工具不会自动改动 U 盘，需要你亲自点一下。",
+                 F_FINE, INK3, CARD).pack(anchor="w", pady=(6, 0))
+        card.pack(fill="both", expand=True)
 
         def close():
             self._notify_open = False
@@ -1699,10 +1862,10 @@ class App(_AppBase):
             close()
             self._open_copy_dialog()
 
-        btns = ttk.Frame(frm)
-        btns.pack(side="bottom", fill="x")
-        ttk.Button(btns, text="📁 随机拷贝一批…", command=go_copy).pack(side="left")
-        ttk.Button(btns, text="暂不处理", command=close).pack(side="right")
+        bar = tk.Frame(outer, bg=BG)
+        bar.pack(fill="x", pady=(14, 0))
+        ui_button(bar, "暂不处理", close, "quiet").pack(side="right")
+        ui_button(bar, "换一批歌", go_copy, "link").pack(side="right", padx=(0, 8))
         win.protocol("WM_DELETE_WINDOW", close)
 
     def _open_diagnose(self):
@@ -1755,7 +1918,7 @@ class App(_AppBase):
                 "提示：改名对多数固件无效",
                 "很多播放设备按 FAT 目录项（拷贝顺序）读盘，不按文件名排序；\n"
                 "这种情况下只改编号前缀完全不会改变播放顺序。\n"
-                "建议先点「🔍 只读诊断」判定，再选「⚡ 极速重排」或「清盘重写」。\n\n"
+                "建议先点「只读诊断」判定，再选「极速重排」或「清盘重写」。\n\n"
                 "仍要继续「仅重命名」吗？"):
             return
         if mode == "fast" and self.recursive.get():
@@ -1785,7 +1948,7 @@ class App(_AppBase):
             est = int(gb * 1024 * 2 / 60)     # 按保守吞吐估算，读+写各一遍
             lines += [
                 "",
-                f"⚠ 按 {ASSUMED_MBPS:g} MB/s 保守估算，需搬运 {gb * 2:.1f} GB，预计约 {est} 分钟。",
+                f"按 {ASSUMED_MBPS:g} MB/s 保守估算，需搬运 {gb * 2:.1f} GB，预计约 {est} 分钟。",
                 "（实际速度取决于你的 U 盘；执行时会显示实时速度与剩余时间。）",
                 f"执行前会把这 {len(self.plan)} 首完整备份到：{BACKUP_ROOT}",
                 "备份校验通过后才会删除 U 盘上的原文件；期间请勿拔出 U 盘。",
@@ -1800,7 +1963,7 @@ class App(_AppBase):
             if mode == "fast" and MANIFEST.is_file():
                 mm = json.loads(MANIFEST.read_text(encoding="utf-8"))
                 if mm.get("verified") is False:
-                    extra = "\n⚠ 目录项顺序校验未通过，请点「一键还原」后改用「清盘重写」"
+                    extra = "\n目录项顺序校验未通过，请点「一键还原」后改用「清盘重写」"
             return (f"洗牌完成：{len(plan)} 首{extra}\n"
                     "记得安全弹出 U 盘并让设备断电重连，再试听顺序。")
         self._run_bg(job)
@@ -1836,19 +1999,26 @@ class DiagnoseDialog(_DialogBase):
     def __init__(self, parent, root: str, recursive: bool = False):
         super().__init__(parent)
         self.transient(parent)
-        self.title("只读诊断 · 不会改动任何文件")
-        self.geometry("760x570")
-        self.minsize(620, 440)
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="🔍 只读诊断", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frm, text="✅ 本次只读取目录与文件属性，没有创建、修改或删除任何文件。",
-                  style="Hint.TLabel").pack(anchor="w", pady=(4, 8))
-        body = ttk.Frame(frm)
+        self.title("只读诊断")
+        self.configure(bg=BG)
+        setup_theme(self)
+        self.geometry("720x540")
+        self.minsize(600, 420)
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=22, pady=20)
+        tk.Label(outer, text="只读诊断", font=F_H2, fg=INK, bg=BG,
+                 anchor="w").pack(fill="x")
+        tk.Label(outer, text="只读取目录与文件属性，没有创建、修改或删除任何文件。",
+                 font=F_SUB, fg=INK2, bg=BG, anchor="w").pack(
+                     fill="x", pady=(2, 12))
+        body = tk.Frame(outer, bg=CARD, highlightbackground=LINE,
+                        highlightthickness=1, bd=0)
         body.pack(fill="both", expand=True)
-        txt = tk.Text(body, wrap="word", font=("Microsoft YaHei UI", 10),
-                      height=20, padx=8, pady=8)
-        sb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        inner = tk.Frame(body, bg=CARD)
+        inner.pack(fill="both", expand=True, padx=10, pady=10)
+        txt = tk.Text(inner, wrap="word", font=("Microsoft YaHei UI", 10),
+                      bg=CARD, fg=INK, relief="flat", bd=0, padx=8, pady=8)
+        sb = ttk.Scrollbar(inner, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
@@ -1859,10 +2029,10 @@ class DiagnoseDialog(_DialogBase):
                            "这仍然是一次只读操作，没有对 U 盘做任何写入。")
         txt.insert("1.0", self.report)
         txt.configure(state="disabled")
-        bar = ttk.Frame(self, padding=(12, 0, 12, 12))
-        bar.pack(fill="x", pady=(0, 4))
-        ttk.Button(bar, text="复制报告", command=self._copy).pack(side="left")
-        ttk.Button(bar, text="关闭", command=self.destroy).pack(side="right")
+        bar = tk.Frame(outer, bg=BG)
+        bar.pack(fill="x", pady=(12, 0))
+        ui_button(bar, "关闭", self.destroy, "quiet").pack(side="right")
+        ui_button(bar, "复制报告", self._copy, "link").pack(side="left")
         self.bind("<Escape>", lambda _: self.destroy())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
@@ -1873,112 +2043,337 @@ class DiagnoseDialog(_DialogBase):
 
 
 class AboutDialog(_DialogBase):
-    """关于 / 支持页：开源信息、免责声明、微信赞赏码。
-
-    只在用户主动点开时出现：不弹窗骚扰、不锁功能、不联网、不统计。
-    """
+    """关于：一句引导语 + 赞赏码 + 版本。其余信息按需展开，不再堆文字。"""
 
     def __init__(self, parent):
         super().__init__(parent)
         self.transient(parent)
-        self.title("关于 / 支持一下")
-        self.geometry("660x620")
-        self.minsize(560, 520)
-        outer = ttk.Frame(self, padding=14)
-        outer.pack(fill="both", expand=True)
+        self.title("关于")
+        self.configure(bg=BG)
+        setup_theme(self)
+        self.geometry("420x540")
+        self.resizable(False, False)
+        self._notice = None
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=26, pady=22)
 
-        ttk.Label(outer, text=f"{APP_NAME}  v{APP_VERSION}",
-                  style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, wraplength=600, style="Hint.TLabel", text=(
-            "给「不支持随机播放」的设备用的歌单乱序工具 · 车载 / 音箱 / 老 MP3 / 骨传导耳机"
-        )).pack(anchor="w", pady=(2, 10))
+        tk.Label(outer, text="ShuffleStick", font=F_H2, fg=INK, bg=BG).pack()
+        tk.Label(outer, text=f"v{APP_VERSION} · MIT 开源 · 完全离线",
+                 font=F_FINE, fg=INK3, bg=BG).pack(pady=(2, 18))
 
-        info = ttk.LabelFrame(outer, text=" 开源与隐私 ", padding=10)
-        info.pack(fill="x", pady=(0, 8))
-        ttk.Label(info, justify="left", wraplength=600, text=(
-            f"许可证：{LICENSE_NAME}（可自由使用、修改、分发，源码完全公开）\n"
-            "完全离线：不联网、不上传任何文件、不收集任何信息、无广告、无捆绑。\n"
-            "所有写操作都需手动点击并二次确认，且只对已绑定的播放设备生效。\n"
-            "插盘只提醒、绝不自动写盘；配置与日志只保存在本机。"
-        )).pack(anchor="w")
-        src = ttk.Frame(info)
-        src.pack(fill="x", pady=(8, 0))
-        url = source_urls()["primary"]
-        ttk.Label(src, text=f"源码：{url}", style="Hint.TLabel").pack(side="left")
-        ttk.Button(src, text="复制地址",
-                   command=lambda: self._copy(url)).pack(side="right")
-
-        warn = ttk.LabelFrame(outer, text=" 使用前请阅读 ", padding=10)
-        warn.pack(fill="x", pady=(0, 8))
-        ttk.Label(warn, justify="left", wraplength=600, text=(
-            "本工具会移动、重命名或删除 U 盘上的音频文件。使用前请自行备份重要数据；\n"
-            "作者不对数据丢失、设备损坏或任何间接损失负责。\n"
-            "「清盘重写」会自动备份到电脑；「随机拷贝 · 替换」删除的旧歌不做电脑备份，\n"
-            "执行前的确认弹窗里会再次明确提示。"
-        )).pack(anchor="w")
-
-        give = ttk.LabelFrame(outer, text=" 支持一下（完全自愿） ", padding=10)
-        give.pack(fill="both", expand=True)
-        st = donate_state()
-        body = ttk.Frame(give)
-        body.pack(fill="both", expand=True)
-        # 二维码在左、文案在右：图再大也不会把底部按钮挤下去
-        img_note = ""
+        card, body = ui_card(outer, pad=22)
+        tk.Label(body, text=DONATE_SLOGAN, font=F_H2, fg=INK, bg=CARD,
+                 wraplength=320, justify="center").pack(pady=(4, 18))
         if DONATE_IMAGE.is_file():
             try:
                 raw = tk.PhotoImage(file=str(DONATE_IMAGE))
-                # 用户自己换的图可能上千像素，等比缩小，别把窗口撑出屏幕
-                n = max(1, -(-raw.width() // 240), -(-raw.height() // 240))
+                n = max(1, -(-raw.width() // 260), -(-raw.height() // 260))
                 self._raw_img = raw
                 self._img = raw.subsample(n, n) if n > 1 else raw
-                ttk.Label(body, image=self._img).pack(side="left", anchor="n",
-                                                     padx=(0, 14))
-            except Exception as exc:
-                img_note = f"赞赏码图片读取失败：{exc}"
+                tk.Label(body, image=self._img, bg=CARD, bd=0).pack()
+                tk.Label(body, text="微信扫一扫 · 完全自愿",
+                         font=F_SUB, fg=INK2, bg=CARD).pack(pady=(14, 2))
+            except Exception:
+                tk.Label(body, text="赞赏码图片无法读取",
+                         font=F_SUB, fg=INK3, bg=CARD).pack()
         else:
-            img_note = ("尚未放置赞赏码图片。把图片存为 assets/donate_wechat.png 后，\n"
-                        "这里会直接显示二维码；没有二维码也不影响任何功能。")
+            tk.Label(body, text="赞赏码图片未随包提供",
+                     font=F_SUB, fg=INK3, bg=CARD).pack()
+            tk.Label(body, text="软件功能不受影响",
+                     font=F_FINE, fg=INK3, bg=CARD).pack(pady=(4, 2))
+        card.pack(fill="x")
 
-        side = ttk.Frame(body)
-        side.pack(side="left", fill="both", expand=True)
-        ttk.Label(side, text=f"「{DONATE_SLOGAN}」", style="Title.TLabel",
-                  wraplength=280).pack(anchor="w", pady=(0, 10))
-        ttk.Label(side, wraplength=280, style="Hint.TLabel", text=(
-            "免费、开源，不锁功能、不弹广告。赞赏完全自愿，不扫也一切照常。"
-        )).pack(anchor="w")
-        ttk.Label(side, wraplength=280, style="Hint.TLabel", text=(
-            f"微信扫一扫 · 已有 {st['count']} 位朋友留过记号"
-            f"（小目标 {st['goal']}，手动记数、不联网）"
-        )).pack(anchor="w", pady=(8, 0))
-        if img_note:
-            ttk.Label(side, wraplength=280, style="Hint.TLabel",
-                      text=img_note).pack(anchor="w", pady=(8, 0))
-        row = ttk.Frame(give)
-        row.pack(fill="x", pady=(8, 0))
-        ttk.Button(row, text="打开 assets 目录", command=self._open_assets).pack(side="left")
-        ttk.Button(row, text="关闭", command=self.destroy).pack(side="right")
-        # 放了大图时按内容自适应，但不超过屏幕可用高度，保证底部按钮始终可见
-        self.update_idletasks()
-        w = max(620, self.winfo_reqwidth())
-        h = min(max(520, self.winfo_reqheight()),
-                max(520, self.winfo_screenheight() - 90))
-        self.geometry(f"{w}x{h}")
+        self.notice_host = tk.Frame(outer, bg=BG)
+        self.notice_host.pack(fill="x")
+        bar = tk.Frame(outer, bg=BG)
+        bar.pack(side="bottom", fill="x", pady=(16, 0))
+        ui_button(bar, "关闭", self.destroy, "quiet").pack(side="right")
+        ui_button(bar, "复制源码地址",
+                  lambda: self._copy(source_urls()["primary"]), "quiet").pack(side="left")
+        ui_button(bar, "使用须知", self._toggle_notice, "quiet").pack(
+            side="left", padx=(0, 10))
         self.bind("<Escape>", lambda _: self.destroy())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _toggle_notice(self):
+        if self._notice is not None:
+            self._notice.destroy()
+            self._notice = None
+            self.geometry("420x540")
+            return
+        self._notice = tk.Frame(self.notice_host, bg=BG)
+        tk.Label(self._notice, text=DISCLAIMER, font=F_FINE, fg=INK2, bg=BG,
+                 wraplength=350, justify="left", anchor="w").pack(
+                     fill="x", pady=(14, 0))
+        self._notice.pack(fill="x")
+        self.update_idletasks()
+        h = min(700, max(540, self.winfo_reqheight() + 20),
+                self.winfo_screenheight() - 80)
+        self.geometry(f"420x{h}")
 
     def _copy(self, text: str):
         self.clipboard_clear()
         self.clipboard_append(text)
-        messagebox.showinfo("已复制", "地址已复制到剪贴板。", parent=self)
+        self.status_text = None
+        messagebox.showinfo("已复制", "源码地址已复制到剪贴板。", parent=self)
 
-    def _open_assets(self):
-        if not ASSETS.is_dir():
-            messagebox.showinfo("提示", f"目录不存在：{ASSETS}", parent=self)
+
+class SetupDialog(_DialogBase):
+    """一次性引导：认识设备 → 选盘 → 绑定。完成后不再出现，也不占日常界面。"""
+
+    STEPS = ("认识设备", "选择 U 盘", "确认绑定")
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.app = parent
+        self.transient(parent)
+        self.title("第一次使用")
+        self.configure(bg=BG)
+        setup_theme(self)
+        self.geometry("500x420")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=28, pady=26)
+        self.steps_bar = tk.Frame(outer, bg=BG)
+        self.steps_bar.pack(fill="x")
+        self.body = tk.Frame(outer, bg=BG)
+        self.body.pack(fill="both", expand=True, pady=(22, 0))
+        self.bar = tk.Frame(outer, bg=BG)
+        self.bar.pack(side="bottom", fill="x")
+        self._show(0)
+
+    def _close(self):
+        self.app._setup_win = None
+        self.destroy()
+
+    def _clear(self):
+        for w in (*self.body.winfo_children(), *self.bar.winfo_children(),
+                  *self.steps_bar.winfo_children()):
+            w.destroy()
+
+    def _head(self, step, title, sub):
+        row = tk.Frame(self.steps_bar, bg=BG)
+        row.pack()
+        for i, name in enumerate(self.STEPS):
+            tk.Label(row, text=f"{i + 1}  {name}", font=F_FINE,
+                     fg=ACCENT if i <= step else INK3, bg=BG).pack(
+                         side="left", padx=(0, 16))
+        tk.Label(self.body, text=title, font=("Microsoft YaHei UI", 16, "bold"),
+                 fg=INK, bg=BG, anchor="w").pack(fill="x", pady=(18, 0))
+        tk.Label(self.body, text=sub, font=F_BODY, fg=INK2, bg=BG,
+                 wraplength=430, justify="left", anchor="w").pack(
+                     fill="x", pady=(10, 0))
+
+    def _show(self, step):
+        self._clear()
+        self._head(step, *({
+            0: ("三步，之后就不用管了",
+                "很多播放器不按文件名读歌，而是按 U 盘里的写入顺序。\n"
+                "这个工具帮你换一批歌、打乱顺序。"),
+            1: ("插上设备，选中盘符", "插好要放歌的 U 盘，从下拉框里选中它。"),
+            2: ("确认这是播放设备", "绑定后只有这块盘允许写入，其它 U 盘一律忽略。"),
+        }[step]))
+        if step == 0:
+            card, c = ui_card(self.body, pad=14)
+            tk.Label(c, text="绑定前不会改动 U 盘上的任何文件。", font=F_SUB,
+                     fg=INK2, bg=CARD, anchor="w", wraplength=390,
+                     justify="left").pack(fill="x")
+            card.pack(fill="x", pady=(20, 0))
+            ui_button(self.bar, "开始", lambda: self._show(1)).pack(side="right")
+            ui_button(self.bar, "以后再说", self._close, "quiet").pack(side="left")
+        elif step == 1:
+            row = tk.Frame(self.body, bg=BG)
+            row.pack(fill="x", pady=(20, 0))
+            cb = ttk.Combobox(row, textvariable=self.app.root_var,
+                              values=list_drives(), width=8, state="readonly")
+            cb.pack(side="left")
+            ui_button(row, "刷新", self._app_refresh, "quiet").pack(
+                side="left", padx=(10, 0))
+            self.dev_info = tk.Label(self.body, text="", font=F_SUB, fg=INK2,
+                                     bg=BG, anchor="w", justify="left",
+                                     wraplength=430)
+            self.dev_info.pack(fill="x", pady=(14, 0))
+            self._info()
+            ui_button(self.bar, "下一步", lambda: self._show(2)).pack(side="right")
+            ui_button(self.bar, "上一步", lambda: self._show(0), "quiet").pack(
+                side="left")
+        else:
+            card, c = ui_card(self.body, pad=16)
+            self.confirm = tk.Label(c, text="", font=F_BODY, fg=INK, bg=CARD,
+                                    anchor="w", justify="left", wraplength=390)
+            self.confirm.pack(fill="x")
+            card.pack(fill="x", pady=(20, 0))
+            self._confirm_text()
+            ui_button(self.bar, "完成设置", self._finish).pack(side="right")
+            ui_button(self.bar, "上一步", lambda: self._show(1), "quiet").pack(
+                side="left")
+
+    def _app_refresh(self):
+        self.app._refresh_drives()
+        self._info()
+
+    def _info(self):
+        root = self.app.root_var.get()
+        if not root or not os.path.isdir(root):
+            self.dev_info.configure(text="未检测到可移动 U 盘，插好后点「刷新」。")
+            return
+        fp = device_fingerprint(root)
+        self.dev_info.configure(
+            text=(f"{root} · {volume_info(root)}\n"
+                  f"卷序列号 {fp['serial'] or '?'} · 当前 {fp['audio_count']} 首音频"))
+
+    def _confirm_text(self):
+        root = self.app.root_var.get()
+        if not root or not os.path.isdir(root):
+            self.confirm.configure(text="设备未就绪，请返回上一步重新选择盘符。")
+            return
+        fp = device_fingerprint(root)
+        self.confirm.configure(
+            text=(f"{root} · {volume_info(root)}\n"
+                  f"容量 {fp['total'] / 1024**3:.1f} GB · {fp['fs']} · "
+                  f"{fp['audio_count']} 首音频\n\n"
+                  "请确认这台设备就是你要放歌的那台，不是存文件的普通 U 盘。"))
+
+    def _finish(self):
+        root = self.app.root_var.get()
+        if not root or not os.path.isdir(root):
+            messagebox.showwarning("设备未就绪", "请先插上播放设备并选中盘符",
+                                   parent=self)
             return
         try:
-            os.startfile(str(ASSETS))          # 只打开本机目录，不联网
+            bind_headset(root, self.app.cfg, model=usb_device_model(root))
         except Exception as exc:
-            messagebox.showwarning("打不开", str(exc), parent=self)
+            messagebox.showerror("绑定失败", str(exc), parent=self)
+            return
+        self.app.cfg["onboarded"] = True
+        save_config(self.app.cfg)
+        self.app._update_device_status()
+        self.app.status.set("已绑定播放设备 · 可以开始换歌了")
+        self._close()
+
+
+class SettingsDialog(_DialogBase):
+    """全部低频参数集中在这里，主界面一个技术选项都不留。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.app = parent
+        self.transient(parent)
+        self.title("设置")
+        self.configure(bg=BG)
+        setup_theme(self)
+        self.geometry("540x640")
+        self.minsize(500, 600)
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=26, pady=22)
+        # 底部固定区先占位，内容再多也不会把「完成」挤出窗口
+        bar = tk.Frame(outer, bg=BG)
+        bar.pack(side="bottom", fill="x", pady=(12, 0))
+        ui_button(bar, "完成", self._close, "quiet").pack(side="right")
+        tk.Label(outer, text="设置", font=F_H2, fg=INK, bg=BG,
+                 anchor="w").pack(fill="x")
+        tk.Label(outer, text="改完自动保存；日常使用不需要动这里。",
+                 font=F_FINE, fg=INK3, bg=BG, anchor="w").pack(
+                     fill="x", pady=(2, 14))
+
+        self.src_var = tk.StringVar(value=str(self.app.cfg.get("source_dir") or ""))
+        self.cap_var = tk.StringVar(
+            value=f"{int(self.app.cfg.get('capacity_mb', 2048)) / 1024:g}")
+
+        self._group(outer, "重排方式")
+        for text, val in (("极速重排 · 秒级，不搬运文件（推荐）", "fast"),
+                          ("清盘重写 · 兼容兜底，较慢", "rewrite"),
+                          ("仅重命名 · 多数设备无效", "rename")):
+            ttk.Radiobutton(outer, text=text, variable=self.app.mode,
+                            value=val, command=self._save).pack(
+                                anchor="w", pady=2, padx=8)
+
+        self._group(outer, "文件与扫描")
+        ttk.Checkbutton(outer, text="改用 001.flac 安全短名（默认保留中文歌名）",
+                        variable=self.app.safe_names,
+                        command=self._on_scan).pack(anchor="w", pady=2, padx=8)
+        ttk.Checkbutton(outer, text="洗牌扫描时包含子目录",
+                        variable=self.app.recursive,
+                        command=self._on_scan).pack(anchor="w", pady=2, padx=8)
+        row = tk.Frame(outer, bg=BG)
+        row.pack(fill="x", pady=(6, 0), padx=8)
+        tk.Label(row, text="随机种子", font=F_SUB, fg=INK2, bg=BG,
+                 width=10, anchor="w").pack(side="left")
+        ttk.Entry(row, textvariable=self.app.seed, width=18).pack(side="left")
+        tk.Label(row, text="留空即每次随机", font=F_FINE, fg=INK3,
+                 bg=BG).pack(side="left", padx=(8, 0))
+
+        self._group(outer, "插盘提醒")
+        ttk.Checkbutton(outer, text="插入设备时提醒我（只提醒，不自动写盘）",
+                        variable=self.app.auto,
+                        command=self._toggle_auto).pack(anchor="w", pady=2, padx=8)
+        row = tk.Frame(outer, bg=BG)
+        row.pack(fill="x", pady=(6, 0), padx=8)
+        tk.Label(row, text="提醒冷却", font=F_SUB, fg=INK2, bg=BG,
+                 width=10, anchor="w").pack(side="left")
+        ttk.Spinbox(row, from_=0, to=240, width=5,
+                    textvariable=self.app.cooldown_var).pack(side="left")
+        tk.Label(row, text="分钟 · 需保持窗口开启", font=F_FINE, fg=INK3,
+                 bg=BG).pack(side="left", padx=(8, 0))
+
+        self._group(outer, "音频库（随机拷贝用）")
+        row = tk.Frame(outer, bg=BG)
+        row.pack(fill="x", pady=2, padx=8)
+        ttk.Entry(row, textvariable=self.src_var, width=38).pack(side="left")
+        ui_button(row, "浏览", self._browse, "link").pack(side="left", padx=(8, 0))
+        row = tk.Frame(outer, bg=BG)
+        row.pack(fill="x", pady=(8, 0), padx=8)
+        tk.Label(row, text="每批容量", font=F_SUB, fg=INK2, bg=BG,
+                 width=10, anchor="w").pack(side="left")
+        ttk.Spinbox(row, from_=0.1, to=64, increment=0.5, width=6,
+                    textvariable=self.cap_var,
+                    command=self._save).pack(side="left")
+        tk.Label(row, text="GB", font=F_FINE, fg=INK3, bg=BG).pack(
+            side="left", padx=(8, 0))
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _: self._close())
+
+    @staticmethod
+    def _group(master, text):
+        line = tk.Frame(master, bg=LINE, height=1)
+        line.pack(fill="x", pady=(10, 6))
+        tk.Label(master, text=text, font=F_FINE, fg=INK3, bg=BG,
+                 anchor="w").pack(fill="x")
+
+    def _on_scan(self):
+        self._save()
+        self.app._rescan()
+
+    def _toggle_auto(self):
+        self.app._toggle_auto()
+        self._save()
+
+    def _browse(self):
+        d = filedialog.askdirectory(parent=self, title="选择本地音频库目录")
+        if d:
+            self.src_var.set(d)
+            self._save()
+
+    def _save(self, *_):
+        cfg = self.app.cfg
+        cfg["shuffle_mode"] = self.app.mode.get()
+        cfg["safe_names"] = bool(self.app.safe_names.get())
+        cfg["scan_recursive"] = bool(self.app.recursive.get())
+        cfg["seed"] = self.app.seed.get()
+        cfg["remind_on_insert"] = bool(self.app.auto.get())
+        cfg["source_dir"] = self.src_var.get()
+        try:
+            cfg["capacity_mb"] = max(64, int(float(self.cap_var.get()) * 1024))
+        except (TypeError, ValueError):
+            pass
+        save_config(cfg)
+
+    def _close(self):
+        self._save()
+        self.app._settings_win = None
+        self.destroy()
 
 
 class CopyDialog(_DialogBase):
@@ -2021,76 +2416,85 @@ class CopyDialog(_DialogBase):
             self._scan_library()
 
     def _build(self):
-        outer = ttk.Frame(self, padding=12)
-        outer.pack(fill="both", expand=True)
+        self.configure(bg=BG)
+        setup_theme(self)
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=22, pady=18)
 
         # 底部固定区先占位，保证按钮不会被挤出窗口
-        foot = ttk.Frame(outer)
-        ttk.Label(foot, textvariable=self.status, style="Hint.TLabel").pack(side="left")
+        foot = tk.Frame(outer, bg=BG)
+        tk.Label(foot, textvariable=self.status, font=F_FINE, fg=INK3,
+                 bg=BG, anchor="w").pack(side="left")
         foot.pack(side="bottom", fill="x", pady=(6, 0))
         self.pbar = ttk.Progressbar(outer, mode="determinate", maximum=100)
         self.pbar.pack(side="bottom", fill="x", pady=(6, 0))
-        act = ttk.Frame(outer)
-        self.go_btn = ttk.Button(act, text="▶ 开始随机拷贝", style="Go.TButton",
-                                 command=self._start)
+        act = tk.Frame(outer, bg=BG)
+        self.go_btn = ui_button(act, "开始拷贝", self._start)
         self.go_btn.pack(side="left")
-        self.shuffle_btn = ttk.Button(act, text="🎲 换一批（仅预览）",
-                                      command=self._reshuffle)
-        self.shuffle_btn.pack(side="left", padx=8)
-        ttk.Button(act, text="关闭", command=self._close).pack(side="right")
-        act.pack(side="bottom", fill="x", pady=(8, 0))
-        ttk.Label(outer, textvariable=self.summary, style="Hint.TLabel").pack(
-            side="bottom", anchor="w", pady=(6, 0))
+        self.shuffle_btn = ui_button(act, "换一批（仅预览）",
+                                     self._reshuffle, "link")
+        self.shuffle_btn.pack(side="left", padx=(12, 0))
+        ui_button(act, "关闭", self._close, "quiet").pack(side="right")
+        act.pack(side="bottom", fill="x", pady=(10, 0))
+        tk.Label(outer, textvariable=self.summary, font=F_SUB, fg=INK2,
+                 bg=BG, anchor="w").pack(side="bottom", fill="x", pady=(8, 0))
 
         fp = device_fingerprint(self.root)
         rec = match_headset(fp, self.cfg) or {}
         free = shutil.disk_usage(self.root).free
-        dev = ttk.LabelFrame(outer, text=" 目标设备 ", padding=8)
-        ttk.Label(dev, justify="left", text=(
-            f"✅ 已识别播放设备：{rec.get('model') or '型号未知'} / {fp['serial']}\n"
-            f"当前 {fp['audio_count']} 首音频 · 可用 {free / 1024**3:.1f} GB · 写入顺序即播放顺序")
-        ).pack(anchor="w")
-        dev.pack(side="top", fill="x", pady=(0, 8))
+        card, dev = ui_card(outer, pad=14)
+        tk.Label(dev, justify="left", anchor="w", font=F_SUB, fg=INK, bg=CARD,
+                 text=(f"{rec.get('model') or '播放设备'} · {self.root} / {fp['serial']}\n"
+                       f"当前 {fp['audio_count']} 首音频 · 可用 {free / 1024**3:.1f} GB")
+                 ).pack(anchor="w")
+        card.pack(fill="x", pady=(0, 6))
 
-        srcf = ttk.LabelFrame(outer, text=" 本地音频库（下次打开自动记住） ", padding=8)
-        r = ttk.Frame(srcf)
-        r.pack(fill="x")
+        self._section(outer, "本地音频库 · 下次打开自动记住")
+        r = tk.Frame(outer, bg=BG)
+        r.pack(fill="x", pady=(6, 0))
         ttk.Entry(r, textvariable=self.src_var).pack(side="left", fill="x", expand=True)
-        self.browse_btn = ttk.Button(r, text="浏览…", command=self._browse)
-        self.browse_btn.pack(side="left", padx=(6, 0))
-        ttk.Button(r, text="扫描", command=self._scan_library).pack(side="left", padx=(6, 0))
-        srcf.pack(side="top", fill="x", pady=(0, 8))
+        self.browse_btn = ttk.Button(r, text="浏览", command=self._browse)
+        self.browse_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(r, text="扫描", command=self._scan_library).pack(
+            side="left", padx=(8, 0))
 
-        opt = ttk.LabelFrame(outer, text=" 筛选条件 ", padding=8)
-        o = ttk.Frame(opt)
-        o.pack(fill="x")
-        ttk.Label(o, text="容量上限：").pack(side="left")
-        ttk.Entry(o, textvariable=self.cap_var, width=8).pack(side="left")
-        ttk.Label(o, text="GB").pack(side="left", padx=(2, 14))
+        self._section(outer, "筛选条件")
+        o = tk.Frame(outer, bg=BG)
+        o.pack(fill="x", pady=(6, 0))
+        tk.Label(o, text="容量上限", font=F_SUB, fg=INK2, bg=BG).pack(side="left")
+        ttk.Entry(o, textvariable=self.cap_var, width=8).pack(side="left", padx=(8, 4))
+        tk.Label(o, text="GB", font=F_FINE, fg=INK3, bg=BG).pack(side="left")
         ttk.Checkbutton(o, text="包含子目录", variable=self.rec_var,
-                        command=self._on_param).pack(side="left")
+                        command=self._on_param).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(o, text="尽量避开上一批", variable=self.avoid_var,
                         command=self._on_param).pack(side="left", padx=(14, 0))
-        ttk.Label(opt, style="Hint.TLabel",
-                  text="按容量随机挑歌；U 盘空间不足时会自动少拷几首并提示。").pack(
-                      anchor="w", pady=(6, 0))
-        opt.pack(side="top", fill="x", pady=(0, 8))
 
-        pv = ttk.LabelFrame(outer, text=" 本次将拷入（顺序 = 写入顺序 = 播放顺序） ", padding=6)
+        self._section(outer, "本次将拷入 · 顺序即播放顺序")
+        pv = tk.Frame(outer, bg=CARD, highlightbackground=LINE,
+                      highlightthickness=1, bd=0)
+        inner = tk.Frame(pv, bg=CARD)
+        inner.pack(fill="both", expand=True, padx=10, pady=10)
         cols = ("no", "name", "mb")
-        tv = ttk.Treeview(pv, columns=cols, show="headings")
+        tv = ttk.Treeview(inner, columns=cols, show="headings")
         tv.heading("no", text="#")
         tv.column("no", width=50, anchor="center", stretch=False)
         tv.heading("name", text="文件名（保留中文歌名，仅换编号）")
-        tv.column("name", width=430, anchor="w")
+        tv.column("name", width=380, anchor="w")
         tv.heading("mb", text="MB")
         tv.column("mb", width=80, anchor="e", stretch=False)
-        sb = ttk.Scrollbar(pv, orient="vertical", command=tv.yview)
+        sb = ttk.Scrollbar(inner, orient="vertical", command=tv.yview)
         tv.configure(yscrollcommand=sb.set)
         tv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tv = tv
-        pv.pack(side="top", fill="both", expand=True)
+        pv.pack(side="top", fill="both", expand=True, pady=(6, 0))
+
+    @staticmethod
+    def _section(master, text):
+        line = tk.Frame(master, bg=LINE, height=1)
+        line.pack(fill="x", pady=(12, 6))
+        tk.Label(master, text=text, font=F_FINE, fg=INK3, bg=BG,
+                 anchor="w").pack(fill="x")
 
     # -- 偏好 ---------------------------------------------------------------
     def _save_prefs(self):
@@ -2210,7 +2614,7 @@ class CopyDialog(_DialogBase):
                 f"源目录：{self.src_var.get()}\n"
                 f"动作：{desc}\n"
                 f"本次：{len(self.picked)} 首 / {total / 1024**3:.2f} GB\n\n"
-                f"⚠ 按 {ASSUMED_MBPS:g} MB/s 保守估算，预计 {secs // 60} 分 {secs % 60} 秒；"
+                f"按 {ASSUMED_MBPS:g} MB/s 保守估算，预计 {secs // 60} 分 {secs % 60} 秒；"
                 "期间请勿拔盘或关窗口。\n\n确认开始？", parent=self):
             return
         self._set_busy(True)
@@ -2261,7 +2665,7 @@ class CopyDialog(_DialogBase):
                         self._save_prefs()
                         self.pbar["value"] = 100
                         warn = ("" if res["verified"] else
-                                "\n⚠ 目录项顺序校验未通过，请试听确认；必要时改用「清盘重写」。")
+                                "\n目录项顺序校验未通过，请试听确认；必要时改用「清盘重写」。")
                         self.status.set(f"完成：{res['count']} 首 / {res['bytes'] / 1024**3:.2f} GB")
                         messagebox.showinfo(
                             "随机拷贝完成",
@@ -2296,7 +2700,7 @@ class CopyDialog(_DialogBase):
 # --------------------------------------------------------------------------- 自检
 
 def selftest_diagnose() -> int:
-    """只读诊断：三种首曲判定、报告文本、纯只读性、打赏进度读取。"""
+    """只读诊断：三种首曲判定、报告文本、纯只读性、赞赏引导语。"""
     import tempfile
 
     print("=== 只读诊断自检 ===")
@@ -2349,20 +2753,8 @@ def selftest_diagnose() -> int:
         finally:
             os.rmdir(empty)
 
-    st = donate_state()
-    assert st["goal"] >= 1 and st["count"] >= 0, st
-    print("  打赏进度默认值 OK：", st)
-    with tempfile.TemporaryDirectory(prefix="shuf_donate_") as td:
-        old = DONATE_STATE
-        globals()["DONATE_STATE"] = Path(td) / "donate.json"
-        try:
-            DONATE_STATE.write_text(json.dumps({"goal": 100, "count": 7}), encoding="utf-8")
-            assert donate_state()["count"] == 7
-            DONATE_STATE.write_text("not-json", encoding="utf-8")
-            assert donate_state()["count"] == 0     # 坏文件要能安全降级
-            print("  打赏进度读取 / 坏文件降级 OK")
-        finally:
-            globals()["DONATE_STATE"] = old
+    assert DONATE_SLOGAN and len(DONATE_SLOGAN) <= 18
+    print("  赞赏引导语 OK：", DONATE_SLOGAN)
     print("=== DIAGNOSE OK ===")
     return 0
 
