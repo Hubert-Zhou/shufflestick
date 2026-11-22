@@ -47,7 +47,7 @@ except ModuleNotFoundError:            # 允许在无 GUI 的解释器上跑 --s
 
 APP_NAME = "U 盘歌单乱序助手"
 APP_ID = "ShuffleStick"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION} · 免费开源"
 LICENSE_NAME = "MIT"
 SOURCE_URL = "https://github.com/Hubert-Zhou/shufflestick"
@@ -2043,7 +2043,11 @@ class DiagnoseDialog(_DialogBase):
 
 
 class AboutDialog(_DialogBase):
-    """关于：一句引导语 + 赞赏码 + 版本。其余信息按需展开，不再堆文字。"""
+    """关于：默认只给一句轻邀请，赞赏码由访客主动点开才出现。
+
+    只有一个收款终点，所以「1 杯 / 3 杯」这类档位在这里会是假交互；
+    不做金额档位、不做人数进度、不做任何联网统计。
+    """
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -2051,9 +2055,9 @@ class AboutDialog(_DialogBase):
         self.title("关于")
         self.configure(bg=BG)
         setup_theme(self)
-        self.geometry("420x540")
         self.resizable(False, False)
         self._notice = None
+        self._donate_open = False
         outer = tk.Frame(self, bg=BG)
         outer.pack(fill="both", expand=True, padx=26, pady=22)
 
@@ -2063,23 +2067,45 @@ class AboutDialog(_DialogBase):
 
         card, body = ui_card(outer, pad=22)
         tk.Label(body, text=DONATE_SLOGAN, font=F_H2, fg=INK, bg=CARD,
-                 wraplength=320, justify="center").pack(pady=(4, 18))
+                 wraplength=320, justify="center").pack(pady=(4, 20))
+
+        # 轻邀请：一枚线性咖啡杯 + 文字按钮。默认不摊开收款码。
+        invite = tk.Frame(body, bg=CARD)
+        cup = tk.Canvas(invite, width=22, height=22, bg=CARD,
+                        highlightthickness=0, bd=0)
+        self._draw_coffee(cup)
+        cup.pack(side="left", padx=(0, 8))
+        self._invite_btn = tk.Button(
+            invite, text="请我喝杯咖啡", command=self._toggle_donate,
+            font=F_BODY, bg=CARD, fg=ACCENT, activebackground=CARD,
+            activeforeground=ACCENT_DARK, relief="flat", bd=0,
+            padx=4, pady=4, cursor="hand2", highlightthickness=0)
+        self._invite_btn.pack(side="left")
+        invite.pack()
+        self._hint = tk.Label(body, text="完全自愿 · 点开才显示赞赏码",
+                              font=F_FINE, fg=INK3, bg=CARD)
+        self._hint.pack(pady=(10, 2))
+
+        # 赞赏码先建好但不 pack，只有点开邀请才出现。
+        self._donate_host = tk.Frame(body, bg=CARD)
         if DONATE_IMAGE.is_file():
             try:
                 raw = tk.PhotoImage(file=str(DONATE_IMAGE))
                 n = max(1, -(-raw.width() // 260), -(-raw.height() // 260))
                 self._raw_img = raw
                 self._img = raw.subsample(n, n) if n > 1 else raw
-                tk.Label(body, image=self._img, bg=CARD, bd=0).pack()
-                tk.Label(body, text="微信扫一扫 · 赞赏码 · 完全自愿",
+                tk.Label(self._donate_host, image=self._img, bg=CARD,
+                         bd=0).pack(pady=(12, 0))
+                tk.Label(self._donate_host,
+                         text="微信扫一扫 · 赞赏码 · 完全自愿",
                          font=F_SUB, fg=INK2, bg=CARD).pack(pady=(14, 2))
             except Exception:
-                tk.Label(body, text="赞赏码图片无法读取",
-                         font=F_SUB, fg=INK3, bg=CARD).pack()
+                tk.Label(self._donate_host, text="赞赏码图片无法读取",
+                         font=F_SUB, fg=INK3, bg=CARD).pack(pady=(16, 2))
         else:
-            tk.Label(body, text="赞赏码图片未随包提供",
-                     font=F_SUB, fg=INK3, bg=CARD).pack()
-            tk.Label(body, text="软件功能不受影响",
+            tk.Label(self._donate_host, text="赞赏码图片未随包提供",
+                     font=F_SUB, fg=INK3, bg=CARD).pack(pady=(16, 2))
+            tk.Label(self._donate_host, text="软件功能不受影响",
                      font=F_FINE, fg=INK3, bg=CARD).pack(pady=(4, 2))
         card.pack(fill="x")
 
@@ -2094,27 +2120,54 @@ class AboutDialog(_DialogBase):
             side="left", padx=(0, 10))
         self.bind("<Escape>", lambda _: self.destroy())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._fit()
+
+    @staticmethod
+    def _draw_coffee(c):
+        """22×22 线性咖啡杯，纯 Canvas 绘制，不引入图片资源与 emoji。"""
+        c.create_line(5, 8, 5, 13, 7, 16, 14, 16, 16, 13, 16, 8,
+                      fill=ACCENT, width=1.4, smooth=True)
+        c.create_line(16, 9, 19, 9, 19, 13, 16, 13,
+                      fill=ACCENT, width=1.4, smooth=True)
+        c.create_line(3, 19, 20, 19, fill=ACCENT, width=1.4)
+        c.create_line(8, 2, 8, 5, fill=ACCENT, width=1.2)
+        c.create_line(12, 2, 12, 5, fill=ACCENT, width=1.2)
+
+    def _fit(self):
+        """按当前展开状态计算窗口高度：折叠时小巧，展开后才长高。"""
+        self.update_idletasks()
+        h = min(720, max(300, self.winfo_reqheight() + 28),
+                self.winfo_screenheight() - 80)
+        self.geometry(f"420x{h}")
+
+    def _toggle_donate(self):
+        if self._donate_open:
+            self._donate_host.pack_forget()
+            self._invite_btn.configure(text="请我喝杯咖啡")
+            self._hint.configure(text="完全自愿 · 点开才显示赞赏码")
+            self._donate_open = False
+        else:
+            self._donate_host.pack(fill="x")
+            self._invite_btn.configure(text="收起赞赏码")
+            self._hint.configure(text="不打赏也能用全部功能")
+            self._donate_open = True
+        self._fit()
 
     def _toggle_notice(self):
         if self._notice is not None:
             self._notice.destroy()
             self._notice = None
-            self.geometry("420x540")
-            return
-        self._notice = tk.Frame(self.notice_host, bg=BG)
-        tk.Label(self._notice, text=DISCLAIMER, font=F_FINE, fg=INK2, bg=BG,
-                 wraplength=350, justify="left", anchor="w").pack(
-                     fill="x", pady=(14, 0))
-        self._notice.pack(fill="x")
-        self.update_idletasks()
-        h = min(700, max(540, self.winfo_reqheight() + 20),
-                self.winfo_screenheight() - 80)
-        self.geometry(f"420x{h}")
+        else:
+            self._notice = tk.Frame(self.notice_host, bg=BG)
+            tk.Label(self._notice, text=DISCLAIMER, font=F_FINE, fg=INK2,
+                     bg=BG, wraplength=350, justify="left", anchor="w").pack(
+                         fill="x", pady=(14, 0))
+            self._notice.pack(fill="x")
+        self._fit()
 
     def _copy(self, text: str):
         self.clipboard_clear()
         self.clipboard_append(text)
-        self.status_text = None
         messagebox.showinfo("已复制", "源码地址已复制到剪贴板。", parent=self)
 
 

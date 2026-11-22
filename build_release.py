@@ -6,7 +6,7 @@
 
 产出：
     release/ShuffleStick/                      绿色软件目录（整个拷走即可用）
-    release/ShuffleStick-v0.9.0-win64.zip      分发用 ZIP
+    release/ShuffleStick-v0.9.1-win64.zip      分发用 ZIP
     release/SHA256SUMS.txt                     包内每个文件的校验和
 
 刻意不做 onefile / UPX / 安装包：
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent
 RELEASE = ROOT / "release"
 DIST = RELEASE / "dist"
 PKG_NAME = "ShuffleStick"
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 PKG = RELEASE / PKG_NAME
 ZIP = RELEASE / f"{PKG_NAME}-v{VERSION}-win64.zip"
 ENTRY = ROOT / "enkor_shuffler.py"
@@ -137,6 +137,14 @@ def main() -> int:
             shutil.copy2(ROOT / doc, PKG / doc)
     # 开源项目：随包附完整源码，下载者不联网也能审阅「这个 exe 到底动了什么」
     shutil.copy2(ENTRY, PKG / ENTRY.name)
+    # README 用相对路径引用界面图，离线解压后也要能看到，不能只剩坏链
+    shots_src = ROOT / "docs" / "screenshots"
+    if shots_src.is_dir():
+        shots_dst = PKG / "docs" / "screenshots"
+        shots_dst.mkdir(parents=True, exist_ok=True)
+        for p in sorted(shots_src.glob("*.png")):
+            shutil.copy2(p, shots_dst / p.name)
+        print(f"     已包含 {len(list(shots_dst.glob('*.png')))} 张界面截图")
     (PKG / "assets").mkdir(exist_ok=True)
     for name in ("repo.json", "README.txt"):
         if (ASSETS / name).is_file():
